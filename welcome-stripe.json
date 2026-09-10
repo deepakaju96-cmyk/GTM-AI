@@ -1,0 +1,439 @@
+{
+  "name": "Welcome \u2014 Stripe",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-welcome-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Form Submission",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst raw=$input.first().json; const f=raw.body??raw;\nconst pick=(...k)=>{for(const x of k) if(f[x]!==undefined&&String(f[x]).trim()!=='') return String(f[x]).trim(); return '';};\nconst name=pick('name','full_name','fullName'), email=pick('email','work_email','workEmail');\nconst company=pick('company','company_name','companyName','organization');\nconst message=pick('message','notes','need','comments');\nlet website=pick('website','company_website','url','domain');\nconst parts=name.split(/\\s+/).filter(Boolean);\nconst first_name=parts.length>1?parts.slice(0,-1).join(' '):(parts[0]||'there');\nconst last_name =parts.length>1?parts[parts.length-1]:(parts[0]||'Unknown');\nconst FREE=new Set(['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','aol.com','proton.me','protonmail.com','live.com','msn.com','me.com']);\nlet domain='';\nif(website) domain=website.replace(/^https?:\\/\\//i,'').replace(/^www\\./i,'').split('/')[0].toLowerCase();\nelse if(email.includes('@')){const d=email.split('@')[1].toLowerCase(); if(!FREE.has(d)) domain=d;}\nreturn [{json:{name,first_name,last_name,email,company:company||domain||'Unknown',message,domain,\n website:domain?'https://'+domain:'',has_company_domain:domain!=='',submitted_at:new Date().toISOString()}}];\n"
+      },
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=New inbound submission:\n- Name: {{ $json.name }}\n- Email: {{ $json.email }}\n- Company as typed: {{ $json.company }}\n- Website: {{ $json.website || '(none given)' }}\n- What they said: {{ $json.message || '(nothing)' }}\n\nResearch this company.",
+        "options": {
+          "systemMessage": "You are a lead-enrichment agent for an inbound marketing form.\n\nYOU HAVE TWO TOOLS:\n- `fetch_company_site` - fetches the company's OWN public website (home, /pricing, /about, /product) and returns page text with exact source URLs. First-party, most trustworthy. Pass the bare domain.\n- `web_search` - runs a web search and returns results with source URLs. Use for things the company's own site will not say: funding, headcount, recent news, how others describe them.\n\nPROCEDURE:\n1. State your search strategy before acting: what do you need to learn, and which tool answers each part?\n2. ALWAYS call `fetch_company_site` first - first-party facts outrank third-party commentary.\n3. Then use `web_search` only for gaps the site could not fill.\n4. AT MOST 4 tool calls TOTAL across both tools. Stop as soon as you can answer.\n5. If a tool returns ok:false or no content, do NOT retry it more than once and do NOT substitute your own knowledge.\n6. Ground every claim: it must appear in a tool result, with the exact SOURCE url attached.\n7. If nothing usable came back, set grounded=false with null company fields.\n8. Never infer the individual's role, seniority or priorities - you only know what they typed.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"grounded\":true|false,\"company\":{\"name\":null,\"what_they_do\":{\"claim\":\"\",\"source\":\"\"},\"segment\":{\"claim\":\"\",\"source\":\"\"},\"signals\":[{\"claim\":\"\",\"source\":\"\"}]},\"omitted_because_unsupported\":[]}",
+          "maxIterations": 4,
+          "returnIntermediateSteps": true
+        }
+      },
+      "name": "Lead Enrichment Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -144,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "name": "fetch_company_site",
+        "description": "Fetch a company's own public website (home, pricing, about, product) and return page text with source URLs. Pass the bare domain, e.g. posthog.com",
+        "workflowId": {
+          "__rl": true,
+          "value": "2GZwW5QT7uk2ebEd",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/2GZwW5QT7uk2ebEd",
+          "cachedResultName": "Tool \u2014 Fetch Company Site (free, no API)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "domain": "={{ $fromAI('domain','The company bare domain, e.g. posthog.com','string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        }
+      },
+      "name": "fetch_company_site",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        -96,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst lead  = $('Normalize Input').first().json;\nconst agent = $input.first().json;\nconst raw   = agent.output ?? agent.text ?? '';\n\nlet p;\ntry { const m = String(raw).match(/\\{[\\s\\S]*\\}/); p = JSON.parse(m ? m[0] : raw); }\ncatch (e) {\n  return [{ json: { ...lead, ok:false, grounded:false, company_intel:{}, sources_cited:[],\n    citation_warnings:['agent returned unparseable output'],\n    intel_text:'Enrichment failed: the agent did not return usable output.',\n    raw:String(raw).slice(0,600) } }];\n}\n\n// Everything the tools actually returned this run.\nlet evidence = '';\nfor (const s of (agent.intermediateSteps || [])) {\n  evidence += ' ' + (typeof s.observation === 'string' ? s.observation : JSON.stringify(s.observation ?? ''));\n}\nevidence = evidence.replace(/\\\\n/g, ' ').toLowerCase();\nconst haveEvidence = evidence.trim().length > 200;\n\nconst warnings = [];\nconst cited = [];\n\nconst cleanSource = (src, label) => {\n  const s = String(src || '').trim();\n  if (!s) { warnings.push(label + ': no source given'); return null; }\n  const urls = s.match(/https?:\\/\\/[^\\s,;)\\]]+/g) || [];\n  if (!urls.length) { warnings.push(label + ': source is not a URL'); return null; }\n  if (urls.length > 1) warnings.push(label + ': ' + urls.length + ' URLs in one citation, kept first');\n  return urls[0].replace(/[.,)]+$/, '');\n};\n\nconst figuresIn = txt => (String(txt).match(/\\d[\\d,]*\\.?\\d*%?/g) || [])\n  .map(x => x.replace(/[.,]+$/, ''))\n  .filter(x => x.replace(/[^\\d]/g, '').length >= 2);\n\nconst keep = (o, label) => {\n  if (!o || typeof o !== 'object') return null;\n  const claim = String(o.claim || '').trim();\n  if (!claim) return null;\n  const src = cleanSource(o.source, label);\n  if (!src) { warnings.push(label + ': dropped, unverifiable citation'); return null; }\n  if (haveEvidence) {\n    const missing = figuresIn(claim).filter(f => !evidence.includes(f.toLowerCase()));\n    if (missing.length) {\n      warnings.push(label + ': DROPPED - figure(s) ' + missing.join(', ') +\n                    ' do not appear in retrieved evidence (likely from model memory)');\n      return null;\n    }\n  }\n  cited.push(src);\n  return { claim, source: src };\n};\n\nconst co = p.company || {};\nconst out = {\n  name: co.name || null,\n  what_they_do: keep(co.what_they_do, 'what_they_do'),\n  segment:      keep(co.segment, 'segment'),\n  signals:      (co.signals || []).map((s,i) => keep(s, 'signal[' + i + ']')).filter(Boolean)\n};\n\nconst grounded = p.grounded === true && cited.length > 0;\n\n// Human-readable rendering for the CRM record. The structured object above is\n// kept for verification; this is what a person actually reads in Salesforce.\nconst lines = [];\nif (!grounded) {\n  lines.push('No verified company information could be established from public sources.');\n} else {\n  if (out.name) lines.push('Company: ' + out.name);\n  if (out.what_they_do) lines.push('What they do: ' + out.what_they_do.claim + '\\n  Source: ' + out.what_they_do.source);\n  if (out.segment)      lines.push('Segment: ' + out.segment.claim + '\\n  Source: ' + out.segment.source);\n  if (out.signals.length) {\n    lines.push('Signals:');\n    out.signals.forEach(s => lines.push('  - ' + s.claim + '\\n    Source: ' + s.source));\n  }\n}\nif (warnings.length) {\n  lines.push('');\n  lines.push('Claims removed by verification:');\n  warnings.forEach(x => lines.push('  - ' + x));\n}\nconst intel_text = lines.join('\\n');\n\nreturn [{ json: { ...lead, ok:true, grounded,\n  company_intel: out,\n  intel_text,\n  unsupported: p.omitted_because_unsupported || [],\n  sources_cited: [...new Set(cited)],\n  citation_warnings: warnings,\n  evidence_chars: evidence.trim().length } }];\n"
+      },
+      "name": "Parse + Verify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_INSTANCE.my.salesforce.com/services/data/v60.0/sobjects/Lead/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "salesforceOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ FirstName:$json.first_name, LastName:$json.last_name, Company:$json.company, Email:$json.email, Website:$json.website, LeadSource:'Web', Status:'Open - Not Contacted', Description:'Stated need: '+($json.message||'n/a')+'\\n\\nEnrichment (verified, '+($json.sources_cited||[]).length+' sources):\\n'+$json.intel_text }) }}",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Sforce-Duplicate-Rule-Header",
+              "value": "allowSave=true"
+            }
+          ]
+        }
+      },
+      "name": "Create Salesforce Lead (MQL)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        496,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write the personalised body for this lead.\n\nLEAD\n- First name: {{ $('Parse + Verify').first().json.first_name }}\n- Company: {{ $('Parse + Verify').first().json.company }}\n- What they asked: {{ $('Parse + Verify').first().json.message || '(nothing stated)' }}\n\nGROUNDED: {{ $('Parse + Verify').first().json.grounded }}\nVERIFIED INTEL: {{ JSON.stringify($('Parse + Verify').first().json.company_intel) }}\nSOURCES: {{ ($('Parse + Verify').first().json.sources_cited || []).join(', ') || '(none)' }}\n\nIf GROUNDED is true you MUST reference at least one specific fact from VERIFIED INTEL, and it must connect to what they asked about. A generic email that could have been sent to any company is a failure.",
+        "options": {
+          "systemMessage": "You write short lifecycle emails to people who just submitted an inbound form. You receive VERIFIED intel where every claim already carries its source.\n\nFORMAT - this matters as much as the content:\n- 3 to 4 SHORT lines. One or two sentences each. Never a dense paragraph.\n- Under 70 words total for the whole body.\n- Separate each line with a blank line.\n- Write ONLY the middle of the email. NO greeting, NO sign-off - the template supplies both.\n- Do NOT write any URLs or links. The template handles links.\n\nCONTENT:\n- Line 1: acknowledge what they actually asked about.\n- Line 2: one specific fact from VERIFIED INTEL that connects to their question. This is the line that proves you read about them.\n- Line 3: what is genuinely relevant to their situation.\n- If GROUNDED is false, write 2 warm lines making NO claims about their company.\n- Never invent statistics, funding, customer counts or headcount.\n- Helpful, not a pitch. No \"hop on a quick call\".\n\nCTA: choose exactly ONE category that best fits what they asked:\n  \"billing\"  - billing, invoicing, subscriptions, usage-based pricing\n  \"pricing\"  - cost, rates, fees\n  \"docs\"     - technical, API, integration questions\n  \"signup\"   - ready to start, general interest\n\nReturn ONLY valid JSON, no fences: {\"subject\":\"\",\"body\":\"\",\"cta\":\"billing|pricing|docs|signup\"}\n\nNEVER state a number (price, percentage, customer count, funding) unless that exact figure appears in VERIFIED INTEL. If it is not there, describe the thing without the number.\n\nNEVER promise or reference anything that does not exist:\n- no \"I've attached\", \"attached guide\", \"see the attachment\" - nothing is attached\n- no \"I'll send you\", \"here's a link\", \"our case study on...\" - you cannot send or link anything\n- no named documents, guides, reports, or resources\nThe ONLY link in this email is the CTA button, which is added automatically after you write. Do not refer to it.",
+          "maxIterations": 2
+        }
+      },
+      "name": "Email Writer Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://YOUR_INSTANCE.my.salesforce.com/services/data/v60.0/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "salesforceOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "SELECT Id, Name, Subject, TemplateType, HtmlValue, Body FROM EmailTemplate WHERE Name = 'Stripe' LIMIT 1"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Fetch 'Stripe' Template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1072,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst lead   = $('Parse + Verify').first().json;\nconst writer = $('Email Writer Agent').first().json;\nconst recs   = ($input.first().json.records) || [];\nif (!recs.length) throw new Error(\"EmailTemplate 'Stripe' not found. Run the setup workflow.\");\nconst tpl = recs[0];\n\nlet personalized='', subject='', cta='billing';\nconst raw = writer.output ?? writer.text ?? '';\ntry {\n  const m = String(raw).match(/\\{[\\s\\S]*\\}/);\n  const wj = JSON.parse(m ? m[0] : raw);\n  personalized = wj.body || '';\n  subject      = wj.subject || '';\n  if (wj.cta) cta = String(wj.cta).toLowerCase().trim();\n} catch(e) { personalized = String(raw).trim(); }\n\n// The model picks a CATEGORY only - never a URL. This makes hallucinated links impossible.\nconst CTA = {\n  billing: { url:'https://stripe.com/billing',              label:'Explore Stripe Billing' },\n  pricing: { url:'https://stripe.com/pricing',              label:'See pricing' },\n  docs:    { url:'https://docs.stripe.com',                 label:'Read the docs' },\n  signup:  { url:'https://dashboard.stripe.com/register',   label:'Create an account' }\n};\nconst chosen = CTA[cta] || CTA.billing;\n\nconst shell  = tpl.HtmlValue || tpl.Body || '';\nconst isHtml = !!tpl.HtmlValue;\n\nconst asHtml = t => String(t).split(/\\n\\s*\\n|\\n/).map(s=>s.trim()).filter(Boolean)\n  .map(p => '<p style=\"margin:0 0 14px;\">' + p + '</p>').join('');\n\nconst bodyToken = isHtml ? asHtml(personalized) : personalized;\n\nconst fill = s => String(s||'')\n  .replace(/\\[\\[FIRST_NAME\\]\\]/g, lead.first_name || 'there')\n  .replace(/\\[\\[PERSONALIZED_BODY\\]\\]/g, bodyToken)\n  .replace(/\\[\\[CTA_URL\\]\\]/g, chosen.url)\n  .replace(/\\[\\[CTA_LABEL\\]\\]/g, chosen.label)\n  .replace(/\\[\\[SUBJECT\\]\\]/g, subject);\n\nconst wordCount = personalized.split(/\\s+/).filter(Boolean).length;\n\nreturn [{ json: {\n  to: lead.email,\n  subject: (fill(tpl.Subject) || subject || 'Thanks for reaching out').trim(),\n  body: fill(shell),\n  is_html: isHtml,\n  cta_choice: cta, cta_url: chosen.url, cta_label: chosen.label,\n  template_id: tpl.Id, template_name: tpl.Name,\n  grounded: lead.grounded, sources_cited: lead.sources_cited,\n  citation_warnings: lead.citation_warnings || [],\n  word_count: wordCount,\n  evidence_chars: lead.evidence_chars ?? null,\n  personalized_preview: personalized\n}}];\n"
+      },
+      "name": "Merge into Template",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1296,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.body }}",
+        "options": {}
+      },
+      "name": "Send Welcome Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1520,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Merge into Template').first().json) }}",
+        "options": {}
+      },
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1744,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-sonnet-4-5-20250929",
+          "cachedResultName": "Claude Sonnet 4.5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        -320,
+        224
+      ],
+      "name": "Anthropic Chat Model"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-sonnet-4-5-20250929",
+          "cachedResultName": "Claude Sonnet 4.5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        656,
+        224
+      ],
+      "name": "Anthropic Chat Model1"
+    },
+    {
+      "parameters": {
+        "name": "web_search",
+        "description": "Run a web search about a company and return results with source URLs. Use for funding, headcount, news, or anything the company's own website will not state.",
+        "workflowId": {
+          "__rl": true,
+          "value": "zW1hVJDFdN2oiTRw",
+          "mode": "list",
+          "cachedResultName": "Tool \u2014 Web Search (Apify, Stripe demo)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "searchQuery": "={{ $fromAI('searchQuery','A specific web search query about the company','string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "searchQuery",
+              "displayName": "searchQuery",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        }
+      },
+      "name": "web_search",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        64,
+        224
+      ]
+    }
+  ],
+  "connections": {
+    "Form Submission": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Lead Enrichment Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Enrichment Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse + Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + Verify": {
+      "main": [
+        [
+          {
+            "node": "Create Salesforce Lead (MQL)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Salesforce Lead (MQL)": {
+      "main": [
+        [
+          {
+            "node": "Email Writer Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Writer Agent": {
+      "main": [
+        [
+          {
+            "node": "Fetch 'Stripe' Template",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch 'Stripe' Template": {
+      "main": [
+        [
+          {
+            "node": "Merge into Template",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge into Template": {
+      "main": [
+        [
+          {
+            "node": "Send Welcome Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Welcome Email": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Lead Enrichment Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Email Writer Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_company_site": {
+      "ai_tool": [
+        [
+          {
+            "node": "Lead Enrichment Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "web_search": {
+      "ai_tool": [
+        [
+          {
+            "node": "Lead Enrichment Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}
